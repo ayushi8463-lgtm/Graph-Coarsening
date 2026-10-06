@@ -137,6 +137,7 @@ def coarsen(r):
     unique_hashes = np.unique(hash_values)
     n_super = len(unique_hashes)
     hash_to_super = {h: s for s, h in enumerate(unique_hashes)}
+    print(hash_to_super)
 
     # Build coarsening matrix C (N x n_super)
     C = np.zeros((N, n_super))

@@ -36,6 +36,7 @@ np.random.seed(0)
 # ----------------------------------------------------------------------
 node_positions = {}     # node_id -> (x, y)
 node_features = {}      # node_id -> np.array of 3 random features
+modified_edges = {}
 edges = set()            # set of frozenset({i, j})
 next_node_id = [0]       # mutable counter
 
@@ -51,12 +52,18 @@ def add_node(x, y):
     node_positions[nid] = (x, y)
     node_features[nid] = np.random.randn(3) * 0.5   # random toy feature vector
     next_node_id[0] += 1
+    modified_edges[nid] = []
     return nid
 
 
 def add_edge(i, j):
     if i != j:
         edges.add(frozenset((i, j)))
+        if coarsen_result["groups"]:
+            if i in modified_edges.keys():
+                modified_edges[i].append(j)
+            else:
+                modified_edges[j].append(i)
 
 
 def delete_node(nid):
@@ -125,6 +132,7 @@ def run_ugc(r, alpha=0.4, l_proj=4, seed=1):
     unique_hashes = np.unique(hash_values)
     hash_to_super = {h: s for s, h in enumerate(unique_hashes)}
     n_super = len(unique_hashes)
+    print(hash_to_super, hash_values)
 
     C = np.zeros((N, n_super))
     for i in range(N):
@@ -257,6 +265,8 @@ def draw_right():
 
 
 def redraw():
+    global coarsen_result
+    print(coarsen_result)
     draw_left()
     draw_right()
 
