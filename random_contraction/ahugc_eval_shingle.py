@@ -696,7 +696,9 @@ def random_split(N, seed):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--datasets", nargs="+", default=["cornell", "film", "citeseer", "cora"])  # pubmed also supported
-    p.add_argument("--model", default="auto", choices=["auto", "gcn", "sgc", "appnp", "mixhop", "both", "all"])
+    p.add_argument("--model", nargs="+", default=["auto"],
+                   choices=["auto", "gcn", "sgc", "appnp", "mixhop", "both", "all"],
+                   help="one or more models; auto/both/all must be used alone")
     p.add_argument("--paper", action="store_true",
                    help="AH-UGC paper setup: F=orig, hash=random, ratio 0.5, alpha=paper (unless overridden)")
     p.add_argument("--F", nargs="+", default=None, help="default: feat orig neigh (orig with --paper)")
@@ -775,12 +777,16 @@ def main():
         N = A.shape[0]
         het = heterophily_alpha(A_lap, y)
         alpha = alpha_value(args.alpha_mode, name, A_lap, y)
-        if args.model == "both":
+        if args.model == ["both"]:
             models = ["gcn", "sgc"]
-        elif args.model == "all":
+        elif args.model == ["all"]:
             models = ["gcn", "sgc", "appnp", "mixhop"]
+        elif args.model == ["auto"]:
+            models = [DEFAULT_MODEL[name]]
+        elif any(m in {"auto", "both", "all"} for m in args.model):
+            raise SystemExit("--model auto, both, and all must each be used alone")
         else:
-            models = [DEFAULT_MODEL[name] if args.model == "auto" else args.model]
+            models = args.model
         print(f"\n=== {name}: N={N} edges={A_lap.nnz if args.source == "authors" else A_lap.nnz//2} feat={X.shape[1]} classes={nc} | 1-homophily={het:.3f} "
               f"homophily={1-het:.3f} paper={PAPER_ALPHA[name]} | USING alpha={alpha:.3f} ({args.alpha_mode}) "
               f"| clf_input={args.clf_input} seeds={args.seeds}", flush=True)
