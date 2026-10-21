@@ -2,7 +2,8 @@
 ahugc_eval.py -- AH-UGC coarsening (random hash or PCA Z-order hash) + node classification
 trained on the coarsened graph and tested on the ORIGINAL graph.
 
-Datasets : cora, citeseer, pubmed (Planetoid), cornell (WebKB), film (Actor)    [PyG, auto-download]
+Datasets : cora, citeseer, pubmed (Planetoid), cornell (WebKB), film (Actor),
+           chameleon, squirrel (WikipediaNetwork)                                [PyG, auto-download]
 F        : feat  = X only
            orig  = [(1-a) X | a A]                     (AH-UGC / UGC augmented feature)
            neigh = [(1-a) X | a mean_nbr(X)]
@@ -52,6 +53,7 @@ Requires: torch, torch_geometric, scipy, numpy.
   python ahugc_eval.py --datasets cora --model both --clf_input X --ratios 0.5 --seeds 3
   python ahugc_eval.py --datasets cora --alpha_mode homophily
   python ahugc_eval_shingle.py --datasets cora citeseer --hash random pca_z dpca shingle shingle_z --F feat
+  python ahugc_eval_shingle.py --datasets cornell pubmed --paper --seeds 10 --out results_paper.csv   # AH-UGC paper setup
 """
 import argparse, csv, os, random, time
 import numpy as np
@@ -61,10 +63,12 @@ import torch
 import torch.nn.functional as Fn
 from torch.nn import Linear  # noqa: F401  (kept to mirror the authors' imports)
 from torch_geometric.nn import GCNConv, SGConv
-from torch_geometric.datasets import Planetoid, WebKB, Actor
+from torch_geometric.datasets import Planetoid, WebKB, Actor, WikipediaNetwork
 
-PAPER_ALPHA = {"cora": 0.19, "citeseer": 0.26, "pubmed": 0.20, "cornell": 0.70, "film": 0.78}
-DEFAULT_MODEL = {"cornell": "sgc", "film": "sgc", "cora": "gcn", "citeseer": "gcn", "pubmed": "gcn"}
+PAPER_ALPHA = {"cora": 0.19, "citeseer": 0.26, "pubmed": 0.20, "cornell": 0.70, "film": 0.78,
+               "chameleon": 0.75, "squirrel": 0.78}
+DEFAULT_MODEL = {"cornell": "sgc", "film": "sgc", "chameleon": "sgc", "squirrel": "sgc",
+                 "cora": "gcn", "citeseer": "gcn", "pubmed": "gcn"}
 L_PROJ = 500            # number of random projectors (paper: "l", value not stated)
 
 
@@ -76,6 +80,8 @@ def load(name, root="data"):
         ds = WebKB(f"{root}/webkb", "Cornell")
     elif name == "film":
         ds = Actor(f"{root}/actor")
+    elif name in ("chameleon", "squirrel"):
+        ds = WikipediaNetwork(f"{root}/wikipedia", name, geom_gcn_preprocess=True)
     else:
         raise ValueError(name)
     d = ds[0]
@@ -435,13 +441,16 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--datasets", nargs="+", default=["cornell", "film", "citeseer", "cora"])  # pubmed also supported
     p.add_argument("--model", default="auto", choices=["auto", "gcn", "sgc", "both"])
-    p.add_argument("--F", nargs="+", default=["feat", "orig", "neigh"])
-    p.add_argument("--hash", nargs="+", default=["random", "pca_z"])
+    p.add_argument("--paper", action="store_true",
+                   help="AH-UGC paper setup: F=orig, hash=random, ratio 0.5, alpha=paper (unless overridden)")
+    p.add_argument("--F", nargs="+", default=None, help="default: feat orig neigh (orig with --paper)")
+    p.add_argument("--hash", nargs="+", default=None, help="default: random pca_z (random with --paper)")
     p.add_argument("--clf_input", default="F", choices=["F", "X"])
-    p.add_argument("--ratios", nargs="+", type=float, default=[0.5, 0.3, 0.1], help="supernodes / nodes")
+    p.add_argument("--ratios", nargs="+", type=float, default=None, help="supernodes / nodes (default 0.5 0.3 0.1; 0.5 with --paper)")
     p.add_argument("--seeds", type=int, default=10)
     p.add_argument("--no_baseline", action="store_true", help="skip the uncoarsened baseline")
-    p.add_argument("--alpha_mode", default="computed", choices=["computed", "homophily", "paper"])
+    p.add_argument("--alpha_mode", default=None, choices=["computed", "homophily", "paper"],
+                   help="default computed (paper with --paper)")
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--gcn_lr", type=float, default=0.003); p.add_argument("--gcn_wd", type=float, default=0.0005)
@@ -451,6 +460,15 @@ def main():
     p.add_argument("--device", default="auto", help="auto | cuda | cuda:1 | cpu")
     p.add_argument("--out", default="results.csv")
     args = p.parse_args()
+    if args.paper:
+        args.F = args.F or ["orig"]
+        args.hash = args.hash or ["random"]
+        args.ratios = args.ratios or [0.5]
+        args.alpha_mode = args.alpha_mode or "paper"
+    args.F = args.F or ["feat", "orig", "neigh"]
+    args.hash = args.hash or ["random", "pca_z"]
+    args.ratios = args.ratios or [0.5, 0.3, 0.1]
+    args.alpha_mode = args.alpha_mode or "computed"
     if args.device == "auto":
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
