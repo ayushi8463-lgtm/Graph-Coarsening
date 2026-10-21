@@ -219,7 +219,8 @@ __marimo__/
 
 .idea
 
-# Downloaded datasets and generated PyTorch Geometric caches
+# Downloaded datasets and generated PyTorch Geometric caches used by
+# random_contraction/ahugc_eval_shingle.py (root default: data/)
 /data/
 /New-Hash/data/
 
@@ -227,5 +228,6 @@ __marimo__/
 /New-Hash/*.csv
 /New-Hash/*.png
 
-# Evaluation output (override with --out when a different path is needed)
-/results_v2.csv
+# Evaluation output from ahugc_eval_shingle.py (default: results.csv).
+# This also covers explicitly named files such as results_paper.csv.
+/results*.csv
