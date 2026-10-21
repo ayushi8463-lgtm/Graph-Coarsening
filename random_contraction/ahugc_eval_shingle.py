@@ -30,7 +30,11 @@ Models   :
         cached=True) -- edge weights NOT used (LINKX calls conv(x, edge_index)); AdamW lr 0.01,
         weight_decay 1e-3 (their sgc_exp.sh sweeps 1e-3/1e-2/1e-1, hops is a script argument,
         default 1), 500 epochs, NLL on log_softmax.
-  Both: after every epoch the model is scored on the ORIGINAL graph; test accuracy is taken at the
+  appnp = two-layer MLP followed by APPNP propagation (K=10, alpha=0.1); Adam lr .003, wd .0005.
+  mixhop = two MixHop layers, each concatenating learned 0/1/2-hop channels with symmetric
+        normalized A+I; Adam lr .01, wd .0005. These are self-contained PyTorch adaptations for
+        the homogeneous benchmarks; use the architecture/optimizer flags below to change defaults.
+  All models: after every epoch the model is scored on the ORIGINAL graph; test accuracy is taken at the
   epoch with the best validation accuracy (strictly greater, first occurrence), as in UGC.py / LINKX.
 Metrics  : HE, RcE, REE of every coarsening, exactly as in the AH-UGC appendix / authors' spectral_properties.py
            (L_lift = C L_c C^T with binary C; HE uses raw X; RcE = log(||L-L_lift||_F^2 / N); REE over the top
@@ -55,7 +59,9 @@ Requires: torch, torch_geometric, scipy, numpy.
   python ahugc_eval.py --datasets cora --model both --clf_input X --ratios 0.5 --seeds 3
   python ahugc_eval.py --datasets cora --alpha_mode homophily
   python ahugc_eval_shingle.py --datasets cora citeseer --hash random pca_z dpca shingle shingle_z --F feat
+  python ahugc_eval_shingle.py --datasets cora citeseer pubmed physics dblp cornell texas film chameleon squirrel penn94 --model all
   python ahugc_eval_shingle.py --datasets cornell pubmed --paper --seeds 10 --out results_paper.csv   # AH-UGC paper setup
+  python ahugc_eval_v2.py --datasets imdb dblp acm --hetero_models HeteroGCN2 --hetero_ratios 0.3
 """
 import argparse, csv, os, random, time, urllib.request
 import numpy as np
@@ -65,7 +71,7 @@ from scipy.sparse.linalg import LinearOperator, svds, eigsh
 import torch
 import torch.nn.functional as Fn
 from torch.nn import Linear  # noqa: F401  (kept to mirror the authors' imports)
-from torch_geometric.nn import GCNConv, SGConv
+from torch_geometric.nn import APPNP as APPNPProp, GCNConv, SGConv
 from torch_geometric.datasets import Planetoid, WebKB, Actor, WikipediaNetwork
 
 PAPER_ALPHA = {"cora": 0.19, "citeseer": 0.26, "pubmed": 0.20, "cornell": 0.70, "film": 0.78,
@@ -473,6 +479,69 @@ class SGC(torch.nn.Module):                # LINKX models.SGC; two cached convs 
         return (self.conv_o if original else self.conv_c)(x, edge_index)   # LINKX ignores edge weights
 
 
+class APPNPNet(torch.nn.Module):
+    """Two-layer MLP followed by personalized PageRank propagation."""
+    def __init__(self, in_channels, hidden_channels, out_channels, k=10, alpha=0.1, dropout=0.5):
+        super().__init__()
+        self.lin1 = Linear(in_channels, hidden_channels)
+        self.lin2 = Linear(hidden_channels, out_channels)
+        self.prop = APPNPProp(K=k, alpha=alpha, dropout=0.0, cached=False)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index, edge_weight=None):
+        x = Fn.dropout(x, p=self.dropout, training=self.training)
+        x = Fn.relu(self.lin1(x))
+        x = Fn.dropout(x, p=self.dropout, training=self.training)
+        x = self.lin2(x)
+        return self.prop(x, edge_index, edge_weight)
+
+
+def mixhop_adjacency(edge_index, edge_weight, num_nodes):
+    """Fixed symmetric-normalized (A+I) sparse operator for 0/1/2-hop MixHop channels."""
+    dev = edge_index.device
+    loop = torch.arange(num_nodes, device=dev)
+    indices = torch.cat((edge_index, torch.stack((loop, loop))), dim=1)
+    weights = torch.ones(edge_index.shape[1], device=dev) if edge_weight is None else edge_weight
+    weights = torch.cat((weights, torch.ones(num_nodes, device=dev, dtype=weights.dtype)))
+    adj = torch.sparse_coo_tensor(indices, weights, (num_nodes, num_nodes), device=dev).coalesce()
+    row, col = adj.indices()
+    deg = torch.zeros(num_nodes, dtype=adj.values().dtype, device=dev)
+    deg.scatter_add_(0, row, adj.values())
+    inv_sqrt = deg.clamp_min(1).rsqrt()
+    values = adj.values() * inv_sqrt[row] * inv_sqrt[col]
+    return torch.sparse_coo_tensor(adj.indices(), values, adj.shape, device=dev).coalesce()
+
+
+class MixHopLayer(torch.nn.Module):
+    """Concatenate separate learned transforms of 0-, 1-, and 2-hop features."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.lins = torch.nn.ModuleList([Linear(in_channels, out_channels) for _ in range(3)])
+
+    def forward(self, x, adj):
+        x1 = torch.sparse.mm(adj, x)
+        x2 = torch.sparse.mm(adj, x1)
+        return torch.cat((self.lins[0](x), self.lins[1](x1), self.lins[2](x2)), dim=-1)
+
+
+class MixHopNet(torch.nn.Module):
+    """Two MixHop layers with 0/1/2-hop channels and a final classifier."""
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super().__init__()
+        self.conv1 = MixHopLayer(in_channels, hidden_channels)
+        self.conv2 = MixHopLayer(3 * hidden_channels, hidden_channels)
+        self.out_lin = Linear(3 * hidden_channels, out_channels)
+        self.dropout = dropout
+
+    def forward(self, x, adj):
+        x = Fn.dropout(x, p=self.dropout, training=self.training)
+        x = Fn.relu(self.conv1(x, adj))
+        x = Fn.dropout(x, p=self.dropout, training=self.training)
+        x = Fn.relu(self.conv2(x, adj))
+        x = Fn.dropout(x, p=self.dropout, training=self.training)
+        return self.out_lin(x)
+
+
 # ------------------------------------------------------------------ training
 def to_t(M):
     return torch.from_numpy(sp.csr_matrix(M).toarray()).float()
@@ -490,12 +559,24 @@ def make_model(name, args, dev, d_in, nc, Xtr, ei_tr, ew_tr, Xo, ei_o, train_is_
         opt = torch.optim.Adam(model.parameters(), lr=args.gcn_lr, weight_decay=args.gcn_wd)
         fwd_tr = lambda: model(Xtr, ei_tr, ew_tr)
         fwd_o = lambda: model(Xo, ei_o, None)             # original graph: unweighted (as in UGC.py)
-    else:
+    elif name == "sgc":
         model = SGC(d_in, nc, args.hops).to(dev)
         model.reset_parameters()
         opt = torch.optim.AdamW(model.parameters(), lr=args.sgc_lr, weight_decay=args.sgc_wd)
         fwd_tr = lambda: model(Xtr, ei_tr, None, original=train_is_original)
         fwd_o = lambda: model(Xo, ei_o, None, original=True)
+    elif name == "appnp":
+        model = APPNPNet(d_in, args.appnp_hidden, nc, args.appnp_k, args.appnp_alpha, args.dropout).to(dev)
+        opt = torch.optim.Adam(model.parameters(), lr=args.appnp_lr, weight_decay=args.appnp_wd)
+        fwd_tr = lambda: model(Xtr, ei_tr, ew_tr)
+        fwd_o = lambda: model(Xo, ei_o, None)
+    else:
+        model = MixHopNet(d_in, args.mixhop_hidden, nc, args.dropout).to(dev)
+        opt = torch.optim.Adam(model.parameters(), lr=args.mixhop_lr, weight_decay=args.mixhop_wd)
+        adj_tr = mixhop_adjacency(ei_tr, ew_tr, Xtr.shape[0])
+        adj_o = mixhop_adjacency(ei_o, None, Xo.shape[0])
+        fwd_tr = lambda: model(Xtr, adj_tr)
+        fwd_o = lambda: model(Xo, adj_o)
     return model, opt, fwd_tr, fwd_o
 
 
@@ -505,7 +586,7 @@ def fit(name, model, opt, fwd_tr, fwd_o, yt, mask, Y, val_t, test_t, epochs):
     for _ in range(epochs):
         model.train(); opt.zero_grad()
         out = fwd_tr()
-        if name == "sgc":
+        if name != "gcn":
             out = Fn.log_softmax(out, dim=1)
         loss = Fn.nll_loss(out[mask], yt[mask])
         loss.backward(); opt.step()
@@ -608,7 +689,7 @@ def random_split(N, seed):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--datasets", nargs="+", default=["cornell", "film", "citeseer", "cora"])  # pubmed also supported
-    p.add_argument("--model", default="auto", choices=["auto", "gcn", "sgc", "both"])
+    p.add_argument("--model", default="auto", choices=["auto", "gcn", "sgc", "appnp", "mixhop", "both", "all"])
     p.add_argument("--paper", action="store_true",
                    help="AH-UGC paper setup: F=orig, hash=random, ratio 0.5, alpha=paper (unless overridden)")
     p.add_argument("--F", nargs="+", default=None, help="default: feat orig neigh (orig with --paper)")
@@ -623,6 +704,12 @@ def main():
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--gcn_lr", type=float, default=0.003); p.add_argument("--gcn_wd", type=float, default=0.0005)
     p.add_argument("--sgc_lr", type=float, default=0.01); p.add_argument("--sgc_wd", type=float, default=1e-3)
+    p.add_argument("--appnp_hidden", type=int, default=64)
+    p.add_argument("--appnp_k", type=int, default=10); p.add_argument("--appnp_alpha", type=float, default=0.1)
+    p.add_argument("--appnp_lr", type=float, default=0.003); p.add_argument("--appnp_wd", type=float, default=0.0005)
+    p.add_argument("--mixhop_hidden", type=int, default=32)
+    p.add_argument("--mixhop_lr", type=float, default=0.01); p.add_argument("--mixhop_wd", type=float, default=0.0005)
+    p.add_argument("--dropout", type=float, default=0.5)
     p.add_argument("--hops", type=int, default=1, help="LINKX sgc_exp.sh default is 1; Wu et al. use 2")
     p.add_argument("--no_metrics", action="store_true", help="skip HE / RcE / REE")
     p.add_argument("--metrics", nargs="+", default=["he", "rce", "ree"], choices=["he", "rce", "ree"],
@@ -679,7 +766,12 @@ def main():
         N = A.shape[0]
         het = heterophily_alpha(A_lap, y)
         alpha = alpha_value(args.alpha_mode, name, A_lap, y)
-        models = ["gcn", "sgc"] if args.model == "both" else [DEFAULT_MODEL[name] if args.model == "auto" else args.model]
+        if args.model == "both":
+            models = ["gcn", "sgc"]
+        elif args.model == "all":
+            models = ["gcn", "sgc", "appnp", "mixhop"]
+        else:
+            models = [DEFAULT_MODEL[name] if args.model == "auto" else args.model]
         print(f"\n=== {name}: N={N} edges={A_lap.nnz if args.source == "authors" else A_lap.nnz//2} feat={X.shape[1]} classes={nc} | 1-homophily={het:.3f} "
               f"homophily={1-het:.3f} paper={PAPER_ALPHA[name]} | USING alpha={alpha:.3f} ({args.alpha_mode}) "
               f"| clf_input={args.clf_input} seeds={args.seeds}", flush=True)
