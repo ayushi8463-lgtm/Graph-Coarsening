@@ -231,3 +231,6 @@ __marimo__/
 # Evaluation output from ahugc_eval_shingle.py (default: results.csv).
 # This also covers explicitly named files such as results_paper.csv.
 /results*.csv
+
+# Result CSVs from the replication run plan
+/runs/

@@ -69,11 +69,17 @@ from torch_geometric.nn import GCNConv, SGConv
 from torch_geometric.datasets import Planetoid, WebKB, Actor, WikipediaNetwork
 
 PAPER_ALPHA = {"cora": 0.19, "citeseer": 0.26, "pubmed": 0.20, "cornell": 0.70, "film": 0.78,
-               "chameleon": 0.75, "squirrel": 0.78}
-DEFAULT_MODEL = {"cornell": "sgc", "film": "sgc", "chameleon": "sgc", "squirrel": "sgc",
+               "chameleon": 0.75, "squirrel": 0.78, "texas": 0.91, "physics": 0.07, "dblp": 0.18, "penn94": 0.53}
+GEOM_SPLIT = {"cora", "citeseer", "pubmed", "cornell", "film", "chameleon", "squirrel", "texas"}  # fixed splits exist
+DEFAULT_MODEL = {"cornell": "sgc", "film": "sgc", "chameleon": "sgc", "squirrel": "sgc", "texas": "sgc",
+                 "penn94": "sgc", "physics": "gcn", "dblp": "gcn",
                  "cora": "gcn", "citeseer": "gcn", "pubmed": "gcn"}
 GG_PIN = "https://raw.githubusercontent.com/graphdml-uiuc-jlu/geom-gcn/f1fc0d14b3b019c562737240d06ec83b07d16a8f"
 UGC_RAW = "https://raw.githubusercontent.com/katariaMohit/UGC-Universal-Graph-Coarsening/main/heterophlic_data"
+# sources PyG's Coauthor('Physics') and CitationFull('DBLP') download, and LINKX's Penn94 (facebook100)
+PHYSICS_URL = "https://raw.githubusercontent.com/shchur/gnn-benchmark/master/data/npz/ms_academic_phy.npz"
+DBLP_URL = "https://github.com/abojchevski/graph2gauss/raw/master/data/dblp.npz"
+PENN94_URL = "https://raw.githubusercontent.com/CUAI/Non-Homophily-Large-Scale/master/data/facebook100/Penn94.mat"
 # files the authors load for chameleon/squirrel (note the authors' 'cameleon' typo in the feature filename)
 AUTHOR_PT = {"chameleon": ("edge_index_chameleon.pt", "label_chameleon.pt", "node_feat_cameleon.pt"),
              "squirrel": ("edge_index_squirrel.pt", "label_squirrel.pt", "node_feat_squirrel.pt")}
@@ -99,7 +105,7 @@ def row_normalize(X):
     return (sp.diags(1.0 / np.maximum(s, 1e-12)) @ X).tocsr()
 
 
-def authors_graph(ei, X, y):
+def authors_graph(ei, X, y, normalize=True):
     """Authors' storage convention (verified against their .pt/.mat files): edges kept as stored
     (asymmetric, duplicates collapsed), existing self-loops dropped for the Laplacian, and one
     self-loop added per node in A (used by F = [(1-a)X | aA] and by the coarse graph).
@@ -112,7 +118,7 @@ def authors_graph(ei, X, y):
     A_lap.eliminate_zeros()
     A = (A_lap + sp.eye(N)).tocsr()
     A.data[:] = 1.0
-    return A, A_lap, row_normalize(X), y
+    return A, A_lap, (row_normalize(X) if normalize else sp.csr_matrix(X)), y
 
 
 def symmetric_graph(ei, N):
@@ -150,23 +156,79 @@ def load(name, source="authors", root="data"):
         A, A_lap, X, y = authors_graph(ei, X, y)
         return A, A_lap, X, y, int(y.max()) + 1
 
-    # Geom-GCN source through PyG (cornell always; chameleon/squirrel/film when source='geom')
-    if name == "cornell":
-        d = WebKB(f"{root}/webkb", "Cornell")[0]
-    elif name == "film":
-        d = Actor(f"{root}/actor")[0]
+    if name in ("physics", "dblp"):
+        # same raw files PyG's Coauthor('Physics') / CitationFull('DBLP') download; graph is symmetric
+        url = PHYSICS_URL if name == "physics" else DBLP_URL
+        z = np.load(fetch(url, f"{root}/raw/{name}.npz"), allow_pickle=True)
+        Aq = sp.csr_matrix((z["adj_data"], z["adj_indices"], z["adj_indptr"]), shape=tuple(z["adj_shape"]))
+        Xq = sp.csr_matrix((z["attr_data"], z["attr_indices"], z["attr_indptr"]), shape=tuple(z["attr_shape"]))
+        y = z["labels"].astype(np.int64)
+        A = symmetric_graph(np.vstack(Aq.nonzero()), Aq.shape[0])
+        return A, A, Xq.astype(np.float64), y, int(y.max()) + 1
+
+    if name == "penn94":
+        # LINKX fb100 loader (dataset.py load_fb100_dataset): label = gender-1 (-1 = unlabeled);
+        # features = one-hot of metadata columns 0 and 2..6, one column per distinct value.
+        m = scipy.io.loadmat(fetch(PENN94_URL, f"{root}/linkx/Penn94.mat"))
+        A = sp.csr_matrix(m["A"]).astype(np.float64)
+        A = ((A + A.T) > 0).astype(np.float64).tolil(); A.setdiag(0); A = A.tocsr(); A.eliminate_zeros()
+        meta = m["local_info"].astype(np.int64)
+        y = meta[:, 1] - 1
+        cols = [meta[:, 0]] + [meta[:, j] for j in range(2, meta.shape[1])]
+        blocks = []
+        for v in cols:
+            u, inv = np.unique(v, return_inverse=True)
+            blocks.append(sp.csr_matrix((np.ones(len(v)), (np.arange(len(v)), inv)), shape=(len(v), len(u))))
+        X = sp.hstack(blocks).tocsr()
+        return A, A, X, y, int(y.max()) + 1
+
+    # Geom-GCN source. Cornell and Film from the pinned commit directly; chameleon/squirrel through PyG
+    # (PyG's WikipediaNetwork already uses the pinned commit).
+    if name in ("cornell", "film", "texas"):
+        ei, X, y = load_geom_pinned(name, root)
     elif name in ("chameleon", "squirrel"):
         d = WikipediaNetwork(f"{root}/wikipedia", name, geom_gcn_preprocess=True)[0]
+        ei, X, y = d.edge_index.numpy(), d.x.numpy().astype(np.float64), d.y.numpy()
     else:
         raise ValueError(name)
-    ei = d.edge_index.numpy(); X = d.x.numpy().astype(np.float64); y = d.y.numpy()
     if source == "authors":
         A, A_lap, X, y = authors_graph(ei, X, y)
     else:
-        A = symmetric_graph(ei, d.num_nodes)
+        A = symmetric_graph(ei, X.shape[0])
         A_lap = A
         X = sp.csr_matrix(X)
     return A, A_lap, X, y, int(y.max()) + 1
+
+
+def load_geom_pinned(name, root="data"):
+    """Cornell / Film read directly from the pinned Geom-GCN commit (f1fc0d14, the files whose heterophily
+    factor and edge counts match the paper). PyG's WebKB and Actor loaders read the 'master' branch, which
+    has different Cornell labels/edges (computed alpha 0.877 instead of the paper's 0.70)."""
+    base = f"{root}/geomgcn_pinned/{name}"
+    nf = fetch(f"{GG_PIN}/new_data/{name}/out1_node_feature_label.txt", f"{base}/nodes.txt")
+    ef = fetch(f"{GG_PIN}/new_data/{name}/out1_graph_edges.txt", f"{base}/edges.txt")
+    rows = open(nf).read().split("\n")[1:-1]
+    N = len(rows)
+    y = np.zeros(N, dtype=np.int64)
+    if name == "film":                                   # sparse index lists, Actor layout
+        dim = 0; idx_rows = [None] * N
+        for l in rows:
+            nid, feat, lab = l.split("\t"); nid = int(nid)
+            idx = [int(v) for v in feat.split(",")] if feat else []
+            idx_rows[nid] = idx; y[nid] = int(lab)
+            if idx: dim = max(dim, max(idx) + 1)
+        X = np.zeros((N, dim), dtype=np.float64)
+        for i, idx in enumerate(idx_rows):
+            X[i, idx] = 1.0
+    else:                                                # dense vectors, WebKB layout
+        X = None
+        for l in rows:
+            nid, feat, lab = l.split("\t"); nid = int(nid)
+            vals = np.array([float(v) for v in feat.split(",")])
+            if X is None: X = np.zeros((N, len(vals)), dtype=np.float64)
+            X[nid] = vals; y[nid] = int(lab)
+    e = np.array([[int(x) for x in l.split("\t")] for l in open(ef).read().split("\n")[1:-1]], dtype=np.int64)
+    return e.T, X, y
 
 
 def load_geom_split(name, s, N, root="data"):
@@ -179,6 +241,8 @@ def load_geom_split(name, s, N, root="data"):
 
 
 def heterophily_alpha(A, y):
+    """alpha = 1 - edge homophily over all edges. Unlabelled nodes (label -1, Penn94) are treated as one
+    class, which reproduces LINKX Table 2 (Penn94 edge homophily 0.470 -> alpha 0.53, as AH-UGC reports)."""
     r, c = A.nonzero()
     return 1.0 - (y[r] == y[c]).mean()
 
@@ -288,8 +352,9 @@ def coarsen(F, ratio, rng, mode, A=None, X=None):
 
 
 def purity(pi, y, nc):
-    c = np.zeros((pi.max() + 1, nc)); np.add.at(c, (pi, y), 1)
-    return c.max(1).sum() / len(pi)
+    ok = y >= 0
+    c = np.zeros((pi.max() + 1, nc)); np.add.at(c, (pi[ok], y[ok]), 1)
+    return c.max(1).sum() / ok.sum()
 
 
 # ------------------------------------------------------------------ spectral metrics (as in the UGC/AH-UGC code)
@@ -339,7 +404,9 @@ def top_eig(Lc, k):
     return np.sort(w)[-k:]
 
 
-def spectral_metrics(ref, A, pi):
+def spectral_metrics(ref, A, pi, which=("he", "rce", "ree")):
+    """Compute only the requested metrics on the partition pi. Returns (he, rce, ree); unrequested = nan."""
+    which = set(which)
     N, n = len(pi), int(pi.max()) + 1
     C = sp.csr_matrix((np.ones(N), (np.arange(N), pi)), shape=(N, n))
     size = np.asarray(C.sum(0)).ravel()
@@ -347,25 +414,29 @@ def spectral_metrics(ref, A, pi):
     Ac.setdiag(0)
     Ac = Ac.tocsr(); Ac.eliminate_zeros()
     Lc = laplacian(Ac)
+    he = rce = ree = float("nan")
     # ---- HE
-    CX = C.T @ ref.X                                   # n x d
-    LcCX = Lc @ CX
-    lift_X = LcCX[pi]                                  # (L_lift X) = C (L_c (C^T X))
-    num = float(np.sum((lift_X - ref.LX) ** 2)) * ref.fX2
-    den = 2.0 * float(np.sum(CX * LcCX)) * ref.trXLX
-    he = float(np.arccosh(1.0 + num / den)) if den > 0 else float("nan")
+    if "he" in which:
+        CX = C.T @ ref.X                                   # n x d
+        LcCX = Lc @ CX
+        lift_X = LcCX[pi]                                  # (L_lift X) = C (L_c (C^T X))
+        num = float(np.sum((lift_X - ref.LX) ** 2)) * ref.fX2
+        den = 2.0 * float(np.sum(CX * LcCX)) * ref.trXLX
+        he = float(np.arccosh(1.0 + num / den)) if den > 0 else float("nan")
     # ---- RcE  ||L - L_lift||_F^2 = ||L||^2 - 2<L,L_lift> + ||L_lift||^2
-    Lcoo = ref.L.tocoo()
-    inner = float(np.sum(Lcoo.data * np.asarray(Lc[pi[Lcoo.row], pi[Lcoo.col]]).ravel()))
-    Lcc = Lc.tocoo()
-    lift_sq = float(np.sum(size[Lcc.row] * size[Lcc.col] * Lcc.data ** 2))
-    rce_raw = max(ref.L_sq - 2.0 * inner + lift_sq, 1e-12)
-    rce = float(np.log(rce_raw / N))
+    if "rce" in which:
+        Lcoo = ref.L.tocoo()
+        inner = float(np.sum(Lcoo.data * np.asarray(Lc[pi[Lcoo.row], pi[Lcoo.col]]).ravel()))
+        Lcc = Lc.tocoo()
+        lift_sq = float(np.sum(size[Lcc.row] * size[Lcc.col] * Lcc.data ** 2))
+        rce_raw = max(ref.L_sq - 2.0 * inner + lift_sq, 1e-12)
+        rce = float(np.log(rce_raw / N))
     # ---- REE (top-k eigenvalues; k capped by the coarse graph size)
-    k = min(ref.k, n)
-    lam = ref.top_eig_L(k)
-    lam_c = top_eig(Lc, k)
-    ree = float(np.mean(np.abs(lam_c - lam) / lam))
+    if "ree" in which:
+        k = min(ref.k, n)
+        lam = ref.top_eig_L(k)
+        lam_c = top_eig(Lc, k)
+        ree = float(np.mean(np.abs(lam_c - lam) / lam))
     return he, rce, ree
 
 
@@ -445,7 +516,7 @@ def fit(name, model, opt, fwd_tr, fwd_o, yt, mask, Y, val_t, test_t, epochs):
         if v > best_val:
             best_val = v
             best_test = (pred[test_t] == Y[test_t]).float().mean().item()
-    return best_test
+    return best_val, best_test
 
 
 def original_input(cache, args, kind, Fin, dev):
@@ -470,7 +541,8 @@ def run_base(name, args, dev, kind, seed, A, X, y, nc, alpha, split, cache):
     Y = torch.from_numpy(y).long().to(dev)
     tr_t, val_t, test_t = (torch.from_numpy(m).to(dev) for m in (train, val, test))
     model, opt, fwd_tr, fwd_o = make_model(name, args, dev, Xo.shape[1], nc, Xo, ei_o, None, Xo, ei_o, True)
-    return fit(name, model, opt, fwd_tr, fwd_o, Y, tr_t, Y, val_t, test_t, args.epochs)
+    _, test_acc = fit(name, model, opt, fwd_tr, fwd_o, Y, tr_t, Y, val_t, test_t, args.epochs)
+    return test_acc
 
 
 def run_one(name, args, dev, kind, mode, ratio, seed, A, X, y, nc, alpha, split, cache, ref):
@@ -502,14 +574,27 @@ def run_one(name, args, dev, kind, mode, ratio, seed, A, X, y, nc, alpha, split,
     val_t, test_t = torch.from_numpy(val).to(dev), torch.from_numpy(test).to(dev)
 
     model, opt, fwd_tr, fwd_o = make_model(name, args, dev, Xc.shape[1], nc, Xc, ei_c, ew_c, Xo, ei_o, False)
-    acc = fit(name, model, opt, fwd_tr, fwd_o, yc, has_train, Y, val_t, test_t, args.epochs)
+    val_acc, test_acc = fit(name, model, opt, fwd_tr, fwd_o, yc, has_train, Y, val_t, test_t, args.epochs)
     if ref is not None:
-        he, rce, r = spectral_metrics(ref, A, pi)
+        seed_all(seed)                                       # eigsh start vectors reproducible per seed
+        he, rce, r = spectral_metrics(ref, A, pi, args.metrics)
     else:
         he = rce = r = float("nan")
     if dev.type == "cuda":
         torch.cuda.empty_cache()
-    return acc, he, rce, r, purity(pi, y, nc), n / N
+    return val_acc, test_acc, he, rce, r, purity(pi, y, nc), n / N
+
+
+def random_split_labeled(y, seed, train=0.6, val=0.2):
+    """Random split over labelled nodes (label >= 0). Default 60/20/20 = authors' UGC.py 'split way 2';
+    Penn94 uses 50/25/25 = LINKX dataset.py get_idx_split defaults (train_prop .5, valid_prop .25)."""
+    N = len(y)
+    idx = np.where(y >= 0)[0]
+    perm = np.random.default_rng(1000 + seed).permutation(idx)
+    a, b = int(train * len(idx)), int((train + val) * len(idx))
+    tr, va, te = (np.zeros(N, bool) for _ in range(3))
+    tr[perm[:a]] = True; va[perm[a:b]] = True; te[perm[b:]] = True
+    return tr, va, te
 
 
 def random_split(N, seed):
@@ -540,8 +625,13 @@ def main():
     p.add_argument("--sgc_lr", type=float, default=0.01); p.add_argument("--sgc_wd", type=float, default=1e-3)
     p.add_argument("--hops", type=int, default=1, help="LINKX sgc_exp.sh default is 1; Wu et al. use 2")
     p.add_argument("--no_metrics", action="store_true", help="skip HE / RcE / REE")
+    p.add_argument("--metrics", nargs="+", default=["he", "rce", "ree"], choices=["he", "rce", "ree"],
+                   help="compute only these spectral metrics in this run (run each metric as its own job); "
+                        "the partition depends only on --seeds/--ratios/--hash, so separate runs see the same coarsening")
     p.add_argument("--device", default="auto", help="auto | cuda | cuda:1 | cpu")
     p.add_argument("--out", default="results.csv")
+    p.add_argument("--best_out", default=None,
+                   help="write per-seed best-accuracy and minimum-metric graph selections here (default: <out>_best.csv)")
     p.add_argument("--source", default="authors", choices=["authors", "geom"],
                    help="authors = their .pt/.mat files + storage convention (default); geom = PyG Geom-GCN, symmetrised")
     p.add_argument("--split", default="geom", choices=["geom", "random"],
@@ -567,11 +657,22 @@ def main():
 
     header = ["dataset", "model", "clf_input", "alpha_mode", "alpha", "F", "hash", "ratio", "seeds",
               "acc_mean", "acc_std", "he", "rce", "ree", "purity", "n_over_N", "per_seed_acc"]
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     new = not os.path.exists(args.out)
     fout = open(args.out, "a", newline="")
     w = csv.writer(fout)
     if new:
         w.writerow(header)
+
+    best_out = args.best_out or (os.path.splitext(args.out)[0] + "_best.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(best_out)), exist_ok=True)
+    best_header = ["dataset", "model", "clf_input", "alpha_mode", "alpha", "seed", "criterion",
+                   "F", "hash", "ratio", "val_acc", "test_acc", "he", "rce", "ree", "purity", "n_over_N"]
+    best_new = not os.path.exists(best_out)
+    best_fout = open(best_out, "a", newline="")
+    best_w = csv.writer(best_fout)
+    if best_new:
+        best_w.writerow(best_header)
 
     for name in args.datasets:
         A, A_lap, X, y, nc = load(name, args.source)
@@ -583,12 +684,16 @@ def main():
               f"homophily={1-het:.3f} paper={PAPER_ALPHA[name]} | USING alpha={alpha:.3f} ({args.alpha_mode}) "
               f"| clf_input={args.clf_input} seeds={args.seeds}", flush=True)
         ref = None if args.no_metrics else SpectralRef(A_lap, X)
-        if args.split == "geom":
+        if args.split == "geom" and name in GEOM_SPLIT:
             splits = [load_geom_split(name, s, N) for s in range(args.seeds)]
+        elif name == "penn94":
+            splits = [random_split_labeled(y, s, 0.5, 0.25) for s in range(args.seeds)]   # LINKX split
         else:
-            splits = [random_split(N, s) for s in range(args.seeds)]
+            splits = [random_split_labeled(y, s) for s in range(args.seeds)]
         cache = {}
         for m in models:
+            candidates_by_seed = [[] for _ in range(args.seeds)]
+
             def report(label_f, label_h, ratio, accs, extra):
                 accs = np.array(accs) * 100
                 he_m, rce_m, ree_m, pur_m, nn_m = extra
@@ -608,11 +713,38 @@ def main():
                 print(f"[model = {m}]  ratio {ratio}   {'F':<6}{'hash':<8}{'acc %':>10}{'HE':>8}{'RcE':>8}{'REE':>8}{'pur %':>8}{'n/N':>7}", flush=True)
                 for kind in args.F:
                     for mode in args.hash:
-                        res = np.array([run_one(m, args, dev, kind, mode, ratio, s, A, X, y, nc, alpha, splits[s], cache, ref)
-                                        for s in range(args.seeds)])
-                        report(kind, mode, ratio, res[:, 0], tuple(res[:, j].mean() for j in range(1, 6)))
+                        records = [run_one(m, args, dev, kind, mode, ratio, s, A, X, y, nc, alpha, splits[s], cache, ref)
+                                   for s in range(args.seeds)]
+                        res = np.asarray(records)
+                        report(kind, mode, ratio, res[:, 1], tuple(res[:, j].mean() for j in range(2, 7)))
+                        for s, row in enumerate(records):
+                            candidates_by_seed[s].append({
+                                "seed": s, "F": kind, "hash": mode, "ratio": ratio,
+                                "val_acc": row[0], "test_acc": row[1], "he": row[2], "rce": row[3],
+                                "ree": row[4], "purity": row[5], "n_over_N": row[6],
+                            })
+
+            # Compare candidate coarsenings within each fixed split/seed. Accuracy selection
+            # uses validation accuracy; test accuracy is reported only after selection.
+            for s, candidates in enumerate(candidates_by_seed):
+                if not candidates:
+                    continue
+                selections = [("max_val_acc", max(candidates, key=lambda c: c["val_acc"]))]
+                for metric in ("he", "rce", "ree"):
+                    finite = [c for c in candidates if np.isfinite(c[metric])]
+                    if finite:
+                        selections.append((f"min_{metric}", min(finite, key=lambda c: c[metric])))
+                for criterion, c in selections:
+                    best_w.writerow([name, m, args.clf_input, args.alpha_mode, f"{alpha:.4f}", s,
+                                     criterion, c["F"], c["hash"], c["ratio"],
+                                     f"{c['val_acc']:.4f}", f"{c['test_acc']:.4f}",
+                                     f"{c['he']:.6f}", f"{c['rce']:.6f}", f"{c['ree']:.6f}",
+                                     f"{100*c['purity']:.2f}", f"{c['n_over_N']:.4f}"])
+            best_fout.flush()
     fout.close()
+    best_fout.close()
     print(f"\nresults appended to {args.out}")
+    print(f"per-seed objective selections appended to {best_out}")
 
 
 if __name__ == "__main__":
