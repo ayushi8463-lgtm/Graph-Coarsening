@@ -23,6 +23,8 @@ hash     : random = AH-UGC Alg. 1: l=500 Gaussian projectors, s_i = mean_k (W_k.
                     neighbour until n = ratio*N          (no bin width)
            pca_z  = same merge procedure, but the order comes from a Morton (Z-order) key over
                     the top-3 principal components of F (centred, sparse-safe, deterministic signs)
+           shingle = relation-aware, type-isolated neighborhood MinHash ordering (three signatures),
+                     followed by the same right-neighbour merge stage.
 Coarse graph (AH-UGC paper, Sec. 3.1):  A_c = C^T A C (weighted, binary C),  F_c = mean of member rows,
            super-node label = majority vote over TRAIN nodes only, loss only on super-nodes that
            contain a train node.   Hetero: type-isolated coarsening (Alg. 2), A_e~ = C_src^T A_e C_dst.
@@ -42,10 +44,13 @@ Models   :
         features of every node type, adjacency D_dst^-1/2 A^T D_src^-1/2 per relation.  Coarse-graph training follows
         its evalue_hgcond (Adam lr 0.01, cross-entropy, validate on the REAL graph each epoch, patience 10 then
         re-initialise, keep best-val weights); "base" follows its train_model_ealystop (Adam lr 0.01, wd 5e-4).
-        HGCond uses 1000 epochs; --hetero_epochs defaults to 200 to keep CPU runs feasible.
+        HGCond uses 1000 epochs; --hetero_epochs defaults to 1000 to match the source budget.
 Splits   : homogeneous: random 60/20/20 per seed (UGC.py "split way 2"); same split for every config of a seed.
-           hetero (--hetero_split public): HGCond's splits (DBLP/IMDB: PyG masks; ACM: 200/200/rest of the labelled
-           papers, seed 0, or --acm_index file); --hetero_split random: 60/20/20 of labelled target nodes per seed.
+           hetero (--hetero_split public): HGCond's splits (DBLP/IMDB: dataset masks; ACM: fixed 200/200/rest
+           labeled-paper order, seed 0, or --acm_index file); --hetero_split random is a non-paper alternative.
+Protocol: hetero defaults match HGCond evaluation: one run, 1000 epochs, hidden=64, 3 layers, Adam lr=.01.
+           Coarse fit uses cross-entropy and patience-10 restarts, validates on the original graph, and tests the
+           best-validation checkpoint. Full-graph baseline uses cross-entropy and weight decay 5e-4.
 --model auto = sgc for cornell/film (paper Table 9), gcn for cora/citeseer/pubmed (Tables 3/8).
 --clf_input F : classifier consumes the same F that was hashed (what the UGC code does)
               X : classifier consumes node features only   (hetero always uses X)
@@ -54,6 +59,7 @@ Requires: torch, torch_geometric, scipy, numpy.
   python ahugc_eval_v2.py --datasets cornell film citeseer cora pubmed            # ratios .5 .3 .1, 10 seeds, both alphas, base
   python ahugc_eval_v2.py --datasets cora --model both --clf_input X --seeds 3 --ree
   python ahugc_eval_v2.py --datasets dblp acm --hetero_models HeteroSGC HeteroGCN --hetero_ratios 0.3
+  python ahugc_eval_v2.py --datasets imdb dblp acm --hetero_models HeteroGCN2 --hetero_F feat --hash shingle --hetero_ratios 0.3
   python ahugc_eval_v2.py --datasets hetero_synth --hetero_epochs 60 --hetero_seeds 2      # no download, smoke test
 """
 import argparse, csv, os, random, time
@@ -165,11 +171,21 @@ def hash_scores(F, mode, rng):
     raise ValueError(mode)
 
 
-def coarsen(F, ratio, rng, mode):
-    """sort by hash score, then random right-neighbour merges until ratio*N super-nodes remain."""
+def coarsen(F, ratio, rng, mode, neighborhoods=None):
+    """sort by hash score/signature, then apply AH-UGC's random adjacent right-merge stage."""
     N = F.shape[0]
-    s = hash_scores(F, mode, rng)
-    groups = [[int(i)] for i in np.argsort(s, kind="stable")]
+    if mode == "shingle":
+        if neighborhoods is None:
+            raise ValueError("shingle coarsening requires a graph/incidence matrix")
+        order = minhash_order(neighborhoods, rng)
+    else:
+        order = np.argsort(hash_scores(F, mode, rng), kind="stable")
+    return merge_order(order, N, ratio, rng)
+
+
+def merge_order(order, N, ratio, rng):
+    """Apply right-neighbor merges to a supplied node order."""
+    groups = [[int(i)] for i in order]
     target = max(1, int(round(ratio * N)))
     while len(groups) > target:
         j = int(rng.integers(len(groups) - 1))
@@ -178,6 +194,30 @@ def coarsen(F, ratio, rng, mode):
     for g, members in enumerate(groups):
         pi[members] = g
     return pi
+
+
+def minhash_order(neighborhoods, rng, nh=3):
+    """Three-signature closed-neighborhood MinHash order over a CSR incidence matrix."""
+    M = sp.csr_matrix(neighborhoods, dtype=np.float32).copy()
+    M.data[:] = 1.0
+    M.eliminate_zeros(); M.sum_duplicates()
+    signatures = []
+    for _ in range(nh):
+        ranks = rng.permutation(M.shape[1])
+        signatures.append(np.minimum.reduceat(ranks[M.indices], M.indptr[:-1]))
+    return np.lexsort(tuple(reversed(signatures)))
+
+
+def hetero_shingle_order(hd, node_type, rng, nh=3):
+    """Relation-aware neighborhood MinHash; relation types have disjoint ID blocks."""
+    n = hd.N[node_type]
+    blocks = [sp.eye(n, format="csr", dtype=np.float32)]
+    for (src, _, dst), A in hd.A.items():
+        if src == node_type:
+            blocks.append(sp.csr_matrix(A, dtype=np.float32))
+        if dst == node_type:
+            blocks.append(sp.csr_matrix(A.T, dtype=np.float32))
+    return minhash_order(sp.hstack(blocks, format="csr"), rng, nh)
 
 
 def purity(pi, y, nc):
@@ -305,7 +345,7 @@ def run_one(model_name, args, dev, kind, mode, ratio, seed, A, X, y, nc, alpha, 
     rng = np.random.default_rng(seed)
 
     F = build_F(kind, A, X, alpha)
-    pi = coarsen(F, ratio, rng, mode)
+    pi = coarsen(F, ratio, rng, mode, A + sp.eye(N, format="csr"))
     n = int(pi.max()) + 1
     C = sp.csr_matrix((np.ones(N), (np.arange(N), pi)), shape=(N, n))
     size = np.asarray(C.sum(0)).ravel()
@@ -702,7 +742,10 @@ def hetero_coarsen_np(hd, kind, mode, ratio, alpha, rng, train):
     """type-isolated coarsening (Alg. 2), numpy/scipy only: per-type assignments, features, coarse relations, labels."""
     pis, Cs = {}, {}
     for t in hd.node_types:
-        pi = coarsen(hetero_F(kind, hd, t, alpha), ratio, rng, mode)
+        if mode == "shingle":
+            pi = merge_order(hetero_shingle_order(hd, t, rng), hd.N[t], ratio, rng)
+        else:
+            pi = coarsen(hetero_F(kind, hd, t, alpha), ratio, rng, mode)
         pis[t] = pi
         Cs[t] = sp.csr_matrix((np.ones(len(pi)), (np.arange(len(pi)), pi)), shape=(len(pi), int(pi.max()) + 1))
     xc = {}
@@ -762,7 +805,7 @@ def main():
                    help="homogeneous: cora citeseer pubmed cornell film | hetero: dblp imdb acm hetero_synth")
     p.add_argument("--model", default="auto", choices=["auto", "gcn", "sgc", "both"])
     p.add_argument("--F", nargs="+", default=["feat", "orig", "neigh"])
-    p.add_argument("--hash", nargs="+", default=["random", "pca_z"])
+    p.add_argument("--hash", nargs="+", default=["random", "pca_z"], choices=["random", "pca_z", "shingle"])
     p.add_argument("--clf_input", default="F", choices=["F", "X"])
     p.add_argument("--ratios", nargs="+", type=float, default=[0.5, 0.3, 0.1], help="supernodes / nodes")
     p.add_argument("--seeds", type=int, default=10)
@@ -782,8 +825,9 @@ def main():
     p.add_argument("--hetero_models", nargs="+", default=["HeteroSGC"], choices=list(HGNN))
     p.add_argument("--hetero_F", nargs="+", default=["feat", "orig"], choices=["feat", "orig", "neigh"])
     p.add_argument("--hetero_ratios", nargs="+", type=float, default=[0.3], help="paper Table 4 uses 0.3")
-    p.add_argument("--hetero_seeds", type=int, default=5)
-    p.add_argument("--hetero_epochs", type=int, default=200, help="HGCond uses 1000")
+    p.add_argument("--hetero_seeds", type=int, default=1,
+                   help="HGCond evalue_hgcond default is one initialization/evaluation")
+    p.add_argument("--hetero_epochs", type=int, default=1000, help="HGCond source default is 1000")
     p.add_argument("--hetero_lr", type=float, default=0.01); p.add_argument("--hetero_wd", type=float, default=5e-4)
     p.add_argument("--hetero_hidden", type=int, default=64); p.add_argument("--hetero_layers", type=int, default=3)
     p.add_argument("--hetero_split", default="public", choices=["public", "random"])
