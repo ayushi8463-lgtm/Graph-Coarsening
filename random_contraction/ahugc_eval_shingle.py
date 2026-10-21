@@ -43,7 +43,9 @@ Alpha    : --alpha_mode computed  -> 1 - edge homophily (fraction of edges joini
                                      reproduces the values in the paper's Table 5/6, e.g. Cora 0.19)
                          homophily -> edge homophily itself (the literal formula printed in Algorithm 1)
                          paper     -> the paper's tabulated value
-Splits   : random 60/20/20 per seed (UGC.py "split way 2"); same split for every config of a seed.
+Splits   : Geom-GCN fixed 60/20/20 splits 0..9 (default, --split geom) or random 60/20/20 per seed (--split random).
+Graphs   : --source authors (default) uses the authors' heterophlic_data/*.pt and film.mat with their storage
+           convention; Cornell comes from the Geom-GCN source (its .pt is not in the repo). --source geom = old setting.
 --model auto = sgc for cornell/film (paper Table 9), gcn for cora/citeseer/pubmed (Tables 3/8).
 --clf_input F : classifier consumes the same F that was hashed (what the UGC code does)
               X : classifier consumes node features only
@@ -55,8 +57,9 @@ Requires: torch, torch_geometric, scipy, numpy.
   python ahugc_eval_shingle.py --datasets cora citeseer --hash random pca_z dpca shingle shingle_z --F feat
   python ahugc_eval_shingle.py --datasets cornell pubmed --paper --seeds 10 --out results_paper.csv   # AH-UGC paper setup
 """
-import argparse, csv, os, random, time
+import argparse, csv, os, random, time, urllib.request
 import numpy as np
+import scipy.io
 import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator, svds, eigsh
 import torch
@@ -69,30 +72,110 @@ PAPER_ALPHA = {"cora": 0.19, "citeseer": 0.26, "pubmed": 0.20, "cornell": 0.70, 
                "chameleon": 0.75, "squirrel": 0.78}
 DEFAULT_MODEL = {"cornell": "sgc", "film": "sgc", "chameleon": "sgc", "squirrel": "sgc",
                  "cora": "gcn", "citeseer": "gcn", "pubmed": "gcn"}
+GG_PIN = "https://raw.githubusercontent.com/graphdml-uiuc-jlu/geom-gcn/f1fc0d14b3b019c562737240d06ec83b07d16a8f"
+UGC_RAW = "https://raw.githubusercontent.com/katariaMohit/UGC-Universal-Graph-Coarsening/main/heterophlic_data"
+# files the authors load for chameleon/squirrel (note the authors' 'cameleon' typo in the feature filename)
+AUTHOR_PT = {"chameleon": ("edge_index_chameleon.pt", "label_chameleon.pt", "node_feat_cameleon.pt"),
+             "squirrel": ("edge_index_squirrel.pt", "label_squirrel.pt", "node_feat_squirrel.pt")}
 L_PROJ = 500            # number of random projectors (paper: "l", value not stated)
 
 
 # ------------------------------------------------------------------ data
-def load(name, root="data"):
-    if name in ("cora", "citeseer", "pubmed"):
-        ds = Planetoid(f"{root}/{name}", name.capitalize() if name != "pubmed" else "PubMed")
-    elif name == "cornell":
-        ds = WebKB(f"{root}/webkb", "Cornell")
-    elif name == "film":
-        ds = Actor(f"{root}/actor")
-    elif name in ("chameleon", "squirrel"):
-        ds = WikipediaNetwork(f"{root}/wikipedia", name, geom_gcn_preprocess=True)
-    else:
-        raise ValueError(name)
-    d = ds[0]
-    N = d.num_nodes
-    ei = d.edge_index.numpy()
+def fetch(url, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(url, path)
+    return path
+
+
+def _np(x):
+    return x.numpy() if hasattr(x, "numpy") else np.asarray(x)
+
+
+def row_normalize(X):
+    """Authors' heterophilic features are row-normalised (each row sums to 1); zero rows stay zero."""
+    X = sp.csr_matrix(X, dtype=np.float64)
+    s = np.asarray(X.sum(1)).ravel()
+    return (sp.diags(1.0 / np.maximum(s, 1e-12)) @ X).tocsr()
+
+
+def authors_graph(ei, X, y):
+    """Authors' storage convention (verified against their .pt/.mat files): edges kept as stored
+    (asymmetric, duplicates collapsed), existing self-loops dropped for the Laplacian, and one
+    self-loop added per node in A (used by F = [(1-a)X | aA] and by the coarse graph).
+    Returns A (with self-loops, for F/coarsening), A_lap (no self-loops, for L and alpha), X, y."""
+    N = X.shape[0]
+    s, t = ei[0], ei[1]
+    keep = s != t
+    A_lap = sp.csr_matrix((np.ones(int(keep.sum())), (s[keep], t[keep])), shape=(N, N))
+    A_lap.data[:] = 1.0
+    A_lap.eliminate_zeros()
+    A = (A_lap + sp.eye(N)).tocsr()
+    A.data[:] = 1.0
+    return A, A_lap, row_normalize(X), y
+
+
+def symmetric_graph(ei, N):
     A = sp.csr_matrix((np.ones(ei.shape[1]), (ei[0], ei[1])), shape=(N, N))
     A = ((A + A.T) > 0).astype(np.float64).tolil()
     A.setdiag(0)
     A = A.tocsr(); A.eliminate_zeros()
-    X = sp.csr_matrix(d.x.numpy().astype(np.float64))
-    return A, X, d.y.numpy(), int(d.y.max()) + 1
+    return A
+
+
+def load(name, source="authors", root="data"):
+    """Returns (A, A_lap, X, y, nc).
+    source='authors': the graphs the AH-UGC/UGC authors load (heterophlic_data/*.pt, film.mat; Cornell from
+                      the Geom-GCN source since its .pt file is not in the repo).
+    source='geom'   : PyG loaders on the Geom-GCN source, symmetrised (our earlier setting)."""
+    if name in ("cora", "citeseer", "pubmed"):
+        ds = Planetoid(f"{root}/{name}", name.capitalize() if name != "pubmed" else "PubMed")
+        d = ds[0]
+        A = symmetric_graph(d.edge_index.numpy(), d.num_nodes)
+        return A, A, sp.csr_matrix(d.x.numpy().astype(np.float64)), d.y.numpy(), int(d.y.max()) + 1
+
+    if source == "authors" and name == "film":
+        m = scipy.io.loadmat(fetch(f"{UGC_RAW}/film.mat", f"{root}/authors/film.mat"))
+        ei = m["edge_index"].astype(np.int64)
+        X = m["node_feat"].astype(np.float64)
+        y = m["label"].ravel().astype(np.int64)
+        A, A_lap, X, y = authors_graph(ei, X, y)
+        return A, A_lap, X, y, int(y.max()) + 1
+
+    if source == "authors" and name in AUTHOR_PT:
+        e, l, f = AUTHOR_PT[name]
+        ei = _np(torch.load(fetch(f"{UGC_RAW}/{e}", f"{root}/authors/{e}"), weights_only=False)).astype(np.int64)
+        y = _np(torch.load(fetch(f"{UGC_RAW}/{l}", f"{root}/authors/{l}"), weights_only=False)).astype(np.int64).ravel()
+        X = _np(torch.load(fetch(f"{UGC_RAW}/{f}", f"{root}/authors/{f}"), weights_only=False)).astype(np.float64)
+        A, A_lap, X, y = authors_graph(ei, X, y)
+        return A, A_lap, X, y, int(y.max()) + 1
+
+    # Geom-GCN source through PyG (cornell always; chameleon/squirrel/film when source='geom')
+    if name == "cornell":
+        d = WebKB(f"{root}/webkb", "Cornell")[0]
+    elif name == "film":
+        d = Actor(f"{root}/actor")[0]
+    elif name in ("chameleon", "squirrel"):
+        d = WikipediaNetwork(f"{root}/wikipedia", name, geom_gcn_preprocess=True)[0]
+    else:
+        raise ValueError(name)
+    ei = d.edge_index.numpy(); X = d.x.numpy().astype(np.float64); y = d.y.numpy()
+    if source == "authors":
+        A, A_lap, X, y = authors_graph(ei, X, y)
+    else:
+        A = symmetric_graph(ei, d.num_nodes)
+        A_lap = A
+        X = sp.csr_matrix(X)
+    return A, A_lap, X, y, int(y.max()) + 1
+
+
+def load_geom_split(name, s, N, root="data"):
+    """Geom-GCN fixed 60/20/20 split s (0..9) from the cited source repo (same files PyG downloads)."""
+    f = fetch(f"{GG_PIN}/splits/{name}_split_0.6_0.2_{s}.npz", f"{root}/geomgcn_splits/{name}_split_0.6_0.2_{s}.npz")
+    z = np.load(f)
+    tr, va, te = (z[k].astype(bool) for k in ("train_mask", "val_mask", "test_mask"))
+    assert len(tr) == N, (name, len(tr), N)
+    return tr, va, te
 
 
 def heterophily_alpha(A, y):
@@ -459,6 +542,10 @@ def main():
     p.add_argument("--no_metrics", action="store_true", help="skip HE / RcE / REE")
     p.add_argument("--device", default="auto", help="auto | cuda | cuda:1 | cpu")
     p.add_argument("--out", default="results.csv")
+    p.add_argument("--source", default="authors", choices=["authors", "geom"],
+                   help="authors = their .pt/.mat files + storage convention (default); geom = PyG Geom-GCN, symmetrised")
+    p.add_argument("--split", default="geom", choices=["geom", "random"],
+                   help="geom = Geom-GCN fixed 60/20/20 splits (default); random = our older random splits")
     args = p.parse_args()
     if args.paper:
         args.F = args.F or ["orig"]
@@ -487,16 +574,19 @@ def main():
         w.writerow(header)
 
     for name in args.datasets:
-        A, X, y, nc = load(name)
+        A, A_lap, X, y, nc = load(name, args.source)
         N = A.shape[0]
-        het = heterophily_alpha(A, y)
-        alpha = alpha_value(args.alpha_mode, name, A, y)
+        het = heterophily_alpha(A_lap, y)
+        alpha = alpha_value(args.alpha_mode, name, A_lap, y)
         models = ["gcn", "sgc"] if args.model == "both" else [DEFAULT_MODEL[name] if args.model == "auto" else args.model]
-        print(f"\n=== {name}: N={N} edges={A.nnz//2} feat={X.shape[1]} classes={nc} | 1-homophily={het:.3f} "
+        print(f"\n=== {name}: N={N} edges={A_lap.nnz if args.source == "authors" else A_lap.nnz//2} feat={X.shape[1]} classes={nc} | 1-homophily={het:.3f} "
               f"homophily={1-het:.3f} paper={PAPER_ALPHA[name]} | USING alpha={alpha:.3f} ({args.alpha_mode}) "
               f"| clf_input={args.clf_input} seeds={args.seeds}", flush=True)
-        ref = None if args.no_metrics else SpectralRef(A, X)
-        splits = [random_split(N, s) for s in range(args.seeds)]
+        ref = None if args.no_metrics else SpectralRef(A_lap, X)
+        if args.split == "geom":
+            splits = [load_geom_split(name, s, N) for s in range(args.seeds)]
+        else:
+            splits = [random_split(N, s) for s in range(args.seeds)]
         cache = {}
         for m in models:
             def report(label_f, label_h, ratio, accs, extra):
