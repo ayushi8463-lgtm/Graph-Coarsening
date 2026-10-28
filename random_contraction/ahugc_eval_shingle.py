@@ -42,6 +42,9 @@ Metrics  : HE, RcE, REE of every coarsening, exactly as in the AH-UGC appendix /
            (L_lift = C L_c C^T with binary C; HE uses raw X; RcE = log(||L-L_lift||_F^2 / N); REE over the top
            k=100 Laplacian eigenvalues, k=N/2 if N<100, capped by the coarse size). Computed exactly with sparse
            algebra on the CPU; the baseline row reports 0 for the three (nothing was coarsened). --no_metrics skips them.
+           --spectral_only skips classifier training and tunes one configuration per hash/ratio for each metric,
+           selecting by the mean metric over seeds. Tune random hash with --alpha_values/--projectors and shingle
+           orders with --shingle_hashes; ratio stays fixed within each selection.
 Device   : --device auto (cuda if available) | cuda | cpu. Training and evaluation run on that device.
 Baseline : every model/input is also trained on the UNCOARSENED graph (same split, same selection rule),
            reported as "none" with ratio 1.0.
@@ -78,10 +81,12 @@ from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.datasets import Planetoid, WebKB, Actor, WikipediaNetwork
 
 PAPER_ALPHA = {"cora": 0.19, "citeseer": 0.26, "pubmed": 0.20, "cornell": 0.70, "film": 0.78,
-               "chameleon": 0.75, "squirrel": 0.78, "texas": 0.91, "physics": 0.07, "dblp": 0.18, "penn94": 0.53}
+               "chameleon": 0.75, "squirrel": 0.78, "texas": 0.91, "physics": 0.07, "dblp": 0.18,
+               "penn94": 0.53, "amherst41": float("nan"), "reed98": float("nan")}
 GEOM_SPLIT = {"cora", "citeseer", "pubmed", "cornell", "film", "chameleon", "squirrel", "texas"}  # fixed splits exist
 DEFAULT_MODEL = {"cornell": "sgc", "film": "sgc", "chameleon": "sgc", "squirrel": "sgc", "texas": "sgc",
                  "penn94": "sgc", "physics": "gcn", "dblp": "gcn",
+                 "amherst41": "sgc", "reed98": "sgc",
                  "cora": "gcn", "citeseer": "gcn", "pubmed": "gcn"}
 GG_PIN = "https://raw.githubusercontent.com/graphdml-uiuc-jlu/geom-gcn/f1fc0d14b3b019c562737240d06ec83b07d16a8f"
 UGC_RAW = "https://raw.githubusercontent.com/katariaMohit/UGC-Universal-Graph-Coarsening/main/heterophlic_data"
@@ -89,6 +94,9 @@ UGC_RAW = "https://raw.githubusercontent.com/katariaMohit/UGC-Universal-Graph-Co
 PHYSICS_URL = "https://raw.githubusercontent.com/shchur/gnn-benchmark/master/data/npz/ms_academic_phy.npz"
 DBLP_URL = "https://github.com/abojchevski/graph2gauss/raw/master/data/dblp.npz"
 PENN94_URL = "https://raw.githubusercontent.com/CUAI/Non-Homophily-Large-Scale/master/data/facebook100/Penn94.mat"
+# LINKX's official Facebook100 files. The LINKX/PyG preprocessing uses the raw
+# adjacency and one-hot encodes metadata columns 0 and 2..end; column 1 is gender.
+FB100_URL = "https://raw.githubusercontent.com/CUAI/Non-Homophily-Large-Scale/master/data/facebook100/{name}.mat"
 # files the authors load for chameleon/squirrel (note the authors' 'cameleon' typo in the feature filename)
 AUTHOR_PT = {"chameleon": ("edge_index_chameleon.pt", "label_chameleon.pt", "node_feat_cameleon.pt"),
              "squirrel": ("edge_index_squirrel.pt", "label_squirrel.pt", "node_feat_squirrel.pt")}
@@ -189,6 +197,26 @@ def load(name, source="authors", root="data"):
             u, inv = np.unique(v, return_inverse=True)
             blocks.append(sp.csr_matrix((np.ones(len(v)), (np.arange(len(v)), inv)), shape=(len(v), len(u))))
         X = sp.hstack(blocks).tocsr()
+        return A, A, X, y, int(y.max()) + 1
+
+    if name in ("amherst41", "reed98"):
+        # Exact LINKX/Facebook100 representation (Lim et al., NeurIPS 2021):
+        # keep the supplied adjacency as stored; y = gender - 1 (-1 is unlabeled);
+        # one-hot encode student/faculty/status/major/second-major/dorm/year columns.
+        # Do not row-normalize these categorical features.
+        key = "Amherst41" if name == "amherst41" else "Reed98"
+        m = scipy.io.loadmat(fetch(FB100_URL.format(name=key), f"{root}/linkx/{key}.mat"))
+        A = sp.csr_matrix(m["A"], dtype=np.float64)
+        A.sum_duplicates(); A.data[:] = 1.0; A.eliminate_zeros()
+        meta = m["local_info"].astype(np.int64)
+        y = meta[:, 1] - 1
+        cols = [meta[:, 0]] + [meta[:, j] for j in range(2, meta.shape[1])]
+        blocks = []
+        for values in cols:
+            _, inv = np.unique(values, return_inverse=True)
+            blocks.append(sp.csr_matrix((np.ones(len(values)), (np.arange(len(values)), inv)),
+                                        shape=(len(values), int(inv.max()) + 1)))
+        X = sp.hstack(blocks, format="csr", dtype=np.float64)
         return A, A, X, y, int(y.max()) + 1
 
     # Geom-GCN source. Cornell and Film from the pinned commit directly; chameleon/squirrel through PyG
@@ -298,10 +326,10 @@ def top_pcs(F, k=5):
     return F @ V - (mu @ V)[None, :]
 
 
-def hash_scores(F, mode, rng):
+def hash_scores(F, mode, rng, projectors=L_PROJ):
     if mode == "random":                       # AH-UGC Algorithm 1, lines 3-6
-        W = rng.normal(size=(F.shape[1], L_PROJ))
-        b = rng.uniform(0, 1, size=L_PROJ)
+        W = rng.normal(size=(F.shape[1], projectors))
+        b = rng.uniform(0, 1, size=projectors)
         return np.asarray(F @ W + b).mean(1)
     if mode == "pca_z":
         return morton(top_pcs(F)[:, :3]).astype(np.float64)
@@ -329,31 +357,34 @@ def minhash(A, rng, nh):
     return out
 
 
-def graph_hash_order(mode, A, X, rng):
+def graph_hash_order(mode, A, X, rng, shingle_hashes=3):
     if mode == "shingle":
-        s = minhash(A, rng, 3)
-        return np.lexsort((s[2], s[1], s[0]))                    # sort by sig_1, ties by sig_2, then sig_3
+        s = minhash(A, rng, shingle_hashes)
+        return np.lexsort(tuple(reversed(s)))
     if mode == "dpca":
         Ah = a_hat(A)
         return np.argsort(morton(top_pcs(Ah @ (Ah @ X))[:, :3]), kind="stable")
     if mode == "shingle_z":
-        return np.lexsort((morton(top_pcs(X)[:, :3]), minhash(A, rng, 1)[0]))
+        s = minhash(A, rng, shingle_hashes)
+        return np.lexsort((morton(top_pcs(X)[:, :3]), *reversed(s)))
     raise ValueError(mode)
 
 
-def coarsen(F, ratio, rng, mode, A=None, X=None):
-    """sort by hash, then random right-neighbour merges until ratio*N super-nodes remain.
+def coarsen(F, ratio, rng, mode, A=None, X=None, projectors=L_PROJ, shingle_hashes=3):
+    """Sort by hash, then randomly merge each selected super-node with its clockwise neighbour.
     random / pca_z hash the feature matrix F; shingle / dpca / shingle_z hash the graph A (and X)."""
     N = F.shape[0]
     if mode in GRAPH_HASHES:
-        order = graph_hash_order(mode, A, X, rng)
+        order = graph_hash_order(mode, A, X, rng, shingle_hashes)
     else:
-        order = np.argsort(hash_scores(F, mode, rng), kind="stable")
+        order = np.argsort(hash_scores(F, mode, rng, projectors), kind="stable")
     groups = [[int(i)] for i in order]
     target = int(round(ratio * N))
     while len(groups) > target:
-        j = int(rng.integers(len(groups) - 1))
-        groups[j] += groups.pop(j + 1)
+        j = int(rng.integers(len(groups)))
+        nxt = (j + 1) % len(groups)
+        groups[j] += groups[nxt]
+        del groups[nxt]
     pi = np.empty(N, dtype=np.int64)
     for g, members in enumerate(groups):
         pi[members] = g
@@ -633,17 +664,22 @@ def run_base(name, args, dev, kind, seed, A, X, y, nc, alpha, split, cache):
     return test_acc
 
 
-def run_one(name, args, dev, kind, mode, ratio, seed, A, X, y, nc, alpha, split, cache, ref):
-    train, val, test = split
+def run_one(name, args, dev, kind, mode, ratio, seed, A, X, y, nc, alpha, split, cache, ref,
+            projectors=L_PROJ, shingle_hashes=3):
+    train, val, test = split if split is not None else (None, None, None)
     N = A.shape[0]
     seed_all(seed)
     rng = np.random.default_rng(seed)
 
     F = build_F(kind, A, X, alpha)
-    pi = coarsen(F, ratio, rng, mode, A, X)
+    pi = coarsen(F, ratio, rng, mode, A, X, projectors, shingle_hashes)
     n = int(pi.max()) + 1
     C = sp.csr_matrix((np.ones(N), (np.arange(N), pi)), shape=(N, n))
     size = np.asarray(C.sum(0)).ravel()
+
+    if args.spectral_only:
+        he, rce, r = spectral_metrics(ref, A, pi, args.metrics)
+        return float("nan"), float("nan"), he, rce, r, purity(pi, y, nc), n / N
 
     Fin = F if args.clf_input == "F" else X
     Fc = sp.diags(1 / size) @ (C.T @ Fin)                    # mean of member rows
@@ -705,6 +741,14 @@ def main():
     p.add_argument("--hash", nargs="+", default=None, help="default: random pca_z (random with --paper)")
     p.add_argument("--clf_input", default="F", choices=["F", "X"])
     p.add_argument("--ratios", nargs="+", type=float, default=None, help="supernodes / nodes (default 0.5 0.3 0.1; 0.5 with --paper)")
+    p.add_argument("--projectors", nargs="+", type=int, default=[L_PROJ],
+                   help=f"random-hash projector counts to tune (default {L_PROJ}; ignored by graph-only hashes)")
+    p.add_argument("--alpha_values", nargs="+", type=float, default=None,
+                   help="feature/adjacency mixing weights to tune; defaults to the selected alpha_mode value")
+    p.add_argument("--shingle_hashes", nargs="+", type=int, default=[3],
+                   help="MinHash signature counts to tune for shingle/shingle_z (default 3)")
+    p.add_argument("--spectral_only", action="store_true",
+                   help="search coarsenings using HE/RcE/REE without training node-classification models")
     p.add_argument("--seeds", type=int, default=10)
     p.add_argument("--no_baseline", action="store_true", help="skip the uncoarsened baseline")
     p.add_argument("--alpha_mode", default=None, choices=["computed", "homophily", "paper"],
@@ -725,16 +769,24 @@ def main():
     p.add_argument("--no_metrics", action="store_true", help="skip HE / RcE / REE")
     p.add_argument("--metrics", nargs="+", default=["he", "rce", "ree"], choices=["he", "rce", "ree"],
                    help="compute only these spectral metrics in this run (run each metric as its own job); "
-                        "the partition depends only on --seeds/--ratios/--hash, so separate runs see the same coarsening")
+                        "same candidate settings and seeds reproduce the same partitions")
     p.add_argument("--device", default="auto", help="auto | cuda | cuda:1 | cpu")
     p.add_argument("--out", default="results.csv")
     p.add_argument("--best_out", default=None,
-                   help="write per-seed best-accuracy and minimum-metric graph selections here (default: <out>_best.csv)")
+                   help="write per-objective tuned configurations and their per-seed results here (default: <out>_best.csv)")
     p.add_argument("--source", default="authors", choices=["authors", "geom"],
                    help="authors = their .pt/.mat files + storage convention (default); geom = PyG Geom-GCN, symmetrised")
     p.add_argument("--split", default="geom", choices=["geom", "random"],
                    help="geom = Geom-GCN fixed 60/20/20 splits (default); random = our older random splits")
     args = p.parse_args()
+    if any(v < 1 for v in args.projectors):
+        raise SystemExit("--projectors values must be positive integers")
+    if any(v < 1 for v in args.shingle_hashes):
+        raise SystemExit("--shingle_hashes values must be positive integers")
+    if args.alpha_values is not None and any(not 0.0 <= v <= 1.0 for v in args.alpha_values):
+        raise SystemExit("--alpha_values must be between 0 and 1")
+    if args.spectral_only and args.no_metrics:
+        raise SystemExit("--spectral_only requires spectral metrics; do not combine it with --no_metrics")
     if args.paper:
         args.F = args.F or ["orig"]
         args.hash = args.hash or ["random"]
@@ -742,7 +794,9 @@ def main():
         args.alpha_mode = args.alpha_mode or "paper"
     args.F = args.F or ["feat", "orig", "neigh"]
     args.hash = args.hash or ["random", "pca_z"]
-    args.ratios = args.ratios or [0.5, 0.3, 0.1]
+    # Spectral tuning defaults to the paper's fixed 50% coarsening level.
+    # Pass --ratios explicitly only when evaluating another target separately.
+    args.ratios = args.ratios or ([0.5] if args.spectral_only else [0.5, 0.3, 0.1])
     args.alpha_mode = args.alpha_mode or "computed"
     if args.device == "auto":
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -750,13 +804,20 @@ def main():
         dev = torch.device(args.device)
         if dev.type == "cuda" and not torch.cuda.is_available():
             raise SystemExit("--device cuda requested but torch.cuda.is_available() is False (CPU-only torch build or no driver)")
-    print(f"device: {dev}" + (f" ({torch.cuda.get_device_name(dev)})" if dev.type == "cuda"
-          else "   <-- training on CPU; install a CUDA build of torch to use the GPU"), flush=True)
+    if args.spectral_only:
+        print("spectral-only tuning: classifier training is disabled", flush=True)
+    else:
+        print(f"device: {dev}" + (f" ({torch.cuda.get_device_name(dev)})" if dev.type == "cuda"
+              else "   <-- training on CPU; install a CUDA build of torch to use the GPU"), flush=True)
 
-    header = ["dataset", "model", "clf_input", "alpha_mode", "alpha", "F", "hash", "ratio", "seeds",
+    header = ["dataset", "model", "clf_input", "alpha_mode", "alpha", "F", "hash", "ratio", "projectors", "shingle_hashes", "seeds",
               "acc_mean", "acc_std", "he", "rce", "ree", "purity", "n_over_N", "per_seed_acc"]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     new = not os.path.exists(args.out)
+    if not new:
+        with open(args.out, newline="") as existing:
+            if next(csv.reader(existing), None) != header:
+                raise SystemExit(f"{args.out} has an older/different CSV schema; choose a new --out path")
     fout = open(args.out, "a", newline="")
     w = csv.writer(fout)
     if new:
@@ -765,8 +826,12 @@ def main():
     best_out = args.best_out or (os.path.splitext(args.out)[0] + "_best.csv")
     os.makedirs(os.path.dirname(os.path.abspath(best_out)), exist_ok=True)
     best_header = ["dataset", "model", "clf_input", "alpha_mode", "alpha", "seed", "criterion",
-                   "F", "hash", "ratio", "val_acc", "test_acc", "he", "rce", "ree", "purity", "n_over_N"]
+                   "F", "hash", "ratio", "projectors", "shingle_hashes", "val_acc", "test_acc", "he", "rce", "ree", "purity", "n_over_N"]
     best_new = not os.path.exists(best_out)
+    if not best_new:
+        with open(best_out, newline="") as existing:
+            if next(csv.reader(existing), None) != best_header:
+                raise SystemExit(f"{best_out} has an older/different CSV schema; choose a new --best_out path")
     best_fout = open(best_out, "a", newline="")
     best_w = csv.writer(best_fout)
     if best_new:
@@ -777,7 +842,10 @@ def main():
         N = A.shape[0]
         het = heterophily_alpha(A_lap, y)
         alpha = alpha_value(args.alpha_mode, name, A_lap, y)
-        if args.model == ["both"]:
+        alpha_values = args.alpha_values or [alpha]
+        if args.spectral_only:
+            models = ["spectral"]
+        elif args.model == ["both"]:
             models = ["gcn", "sgc"]
         elif args.model == ["all"]:
             models = ["gcn", "sgc", "appnp", "mixhop"]
@@ -788,10 +856,12 @@ def main():
         else:
             models = args.model
         print(f"\n=== {name}: N={N} edges={A_lap.nnz if args.source == "authors" else A_lap.nnz//2} feat={X.shape[1]} classes={nc} | 1-homophily={het:.3f} "
-              f"homophily={1-het:.3f} paper={PAPER_ALPHA[name]} | USING alpha={alpha:.3f} ({args.alpha_mode}) "
+              f"homophily={1-het:.3f} paper={PAPER_ALPHA[name]} | alpha candidates={alpha_values} ({args.alpha_mode}) "
               f"| clf_input={args.clf_input} seeds={args.seeds}", flush=True)
         ref = None if args.no_metrics else SpectralRef(A_lap, X)
-        if args.split == "geom" and name in GEOM_SPLIT:
+        if args.spectral_only:
+            splits = [None] * args.seeds
+        elif args.split == "geom" and name in GEOM_SPLIT:
             splits = [load_geom_split(name, s, N) for s in range(args.seeds)]
         elif name == "penn94":
             splits = [random_split_labeled(y, s, 0.5, 0.25) for s in range(args.seeds)]   # LINKX split
@@ -801,52 +871,85 @@ def main():
         for m in models:
             candidates_by_seed = [[] for _ in range(args.seeds)]
 
-            def report(label_f, label_h, ratio, accs, extra):
+            def report(label_f, label_h, ratio, projectors, shingle_hashes, alpha_used, accs, extra):
                 accs = np.array(accs) * 100
                 he_m, rce_m, ree_m, pur_m, nn_m = extra
                 print(f"{'':<14}{label_f:<6}{label_h:<8}{accs.mean():6.2f}±{accs.std():4.2f}"
                       f"{he_m:8.3f}{rce_m:8.3f}{ree_m:8.3f}{100*pur_m:8.2f}{nn_m:7.3f}", flush=True)
-                w.writerow([name, m, args.clf_input, args.alpha_mode, f"{alpha:.4f}", label_f, label_h, ratio,
+                w.writerow([name, m, args.clf_input, args.alpha_mode, f"{alpha_used:.4f}", label_f, label_h, ratio,
+                            projectors, shingle_hashes,
                             args.seeds, f"{accs.mean():.3f}", f"{accs.std():.3f}", f"{he_m:.4f}", f"{rce_m:.4f}",
                             f"{ree_m:.4f}", f"{100*pur_m:.2f}", f"{nn_m:.4f}", ";".join(f"{a:.2f}" for a in accs)])
                 fout.flush()
 
-            if not args.no_baseline:
+            if not args.no_baseline and not args.spectral_only:
                 print(f"[model = {m}]  uncoarsened baseline (ratio 1.0)   {'F':<6}{'hash':<8}{'acc %':>10}", flush=True)
                 for kind in (args.F if args.clf_input == "F" else ["feat"]):
                     accs = [run_base(m, args, dev, kind, s, A, X, y, nc, alpha, splits[s], cache) for s in range(args.seeds)]
-                    report(kind if args.clf_input == "F" else "X", "none", 1.0, accs, (0.0, 0.0, 0.0, 1.0, 1.0))
+                    report(kind if args.clf_input == "F" else "X", "none", 1.0, "", "", alpha, accs,
+                           (0.0, 0.0, 0.0, 1.0, 1.0))
             for ratio in args.ratios:
                 print(f"[model = {m}]  ratio {ratio}   {'F':<6}{'hash':<8}{'acc %':>10}{'HE':>8}{'RcE':>8}{'REE':>8}{'pur %':>8}{'n/N':>7}", flush=True)
                 for kind in args.F:
                     for mode in args.hash:
-                        records = [run_one(m, args, dev, kind, mode, ratio, s, A, X, y, nc, alpha, splits[s], cache, ref)
-                                   for s in range(args.seeds)]
-                        res = np.asarray(records)
-                        report(kind, mode, ratio, res[:, 1], tuple(res[:, j].mean() for j in range(2, 7)))
-                        for s, row in enumerate(records):
-                            candidates_by_seed[s].append({
-                                "seed": s, "F": kind, "hash": mode, "ratio": ratio,
-                                "val_acc": row[0], "test_acc": row[1], "he": row[2], "rce": row[3],
-                                "ree": row[4], "purity": row[5], "n_over_N": row[6],
-                            })
+                        projector_values = args.projectors if mode == "random" else [""]
+                        shingle_values = args.shingle_hashes if mode in ("shingle", "shingle_z") else [""]
+                        alpha_candidates = args.alpha_values or [alpha]
+                        if mode not in ("random", "pca_z"):
+                            alpha_candidates = [alpha]
+                        for projectors in projector_values:
+                            n_projectors = projectors if projectors != "" else L_PROJ
+                            for shingle_hashes in shingle_values:
+                                n_shingle_hashes = shingle_hashes if shingle_hashes != "" else 3
+                                for alpha_used in alpha_candidates:
+                                    records = [run_one(m, args, dev, kind, mode, ratio, s, A, X, y, nc,
+                                                       alpha_used, splits[s], cache, ref, n_projectors,
+                                                       n_shingle_hashes)
+                                               for s in range(args.seeds)]
+                                    res = np.asarray(records)
+                                    report(kind, mode, ratio, projectors, shingle_hashes, alpha_used, res[:, 1],
+                                           tuple(res[:, j].mean() for j in range(2, 7)))
+                                    for s, row in enumerate(records):
+                                        candidates_by_seed[s].append({
+                                            "seed": s, "F": kind, "hash": mode, "ratio": ratio,
+                                            "projectors": projectors, "shingle_hashes": shingle_hashes,
+                                            "alpha": alpha_used,
+                                            "val_acc": row[0], "test_acc": row[1], "he": row[2], "rce": row[3],
+                                            "ree": row[4], "purity": row[5], "n_over_N": row[6],
+                                        })
 
-            # Compare candidate coarsenings within each fixed split/seed. Accuracy selection
-            # uses validation accuracy; test accuracy is reported only after selection.
-            for s, candidates in enumerate(candidates_by_seed):
-                if not candidates:
-                    continue
-                selections = [("max_val_acc", max(candidates, key=lambda c: c["val_acc"]))]
-                for metric in ("he", "rce", "ree"):
-                    finite = [c for c in candidates if np.isfinite(c[metric])]
-                    if finite:
-                        selections.append((f"min_{metric}", min(finite, key=lambda c: c[metric])))
-                for criterion, c in selections:
-                    best_w.writerow([name, m, args.clf_input, args.alpha_mode, f"{alpha:.4f}", s,
-                                     criterion, c["F"], c["hash"], c["ratio"],
-                                     f"{c['val_acc']:.4f}", f"{c['test_acc']:.4f}",
-                                     f"{c['he']:.6f}", f"{c['rce']:.6f}", f"{c['ree']:.6f}",
-                                     f"{100*c['purity']:.2f}", f"{c['n_over_N']:.4f}"])
+            # Tune one configuration per hash method, ratio, and objective using
+            # mean validation accuracy / mean spectral metric across seeds. Then
+            # report that same selected configuration for every seed. This keeps
+            # the spectral objectives independent and avoids per-seed hyperparameter
+            # selection. Random and shingle are never pooled together.
+            by_method = {}
+            for seed, candidates in enumerate(candidates_by_seed):
+                for candidate in candidates:
+                    by_method.setdefault((candidate["hash"], candidate["ratio"]), []).append(
+                        (seed, candidate))
+            for (hash_name, ratio), method_candidates in sorted(by_method.items()):
+                by_config = {}
+                for seed, candidate in method_candidates:
+                    key = (candidate["F"], candidate["projectors"], candidate["shingle_hashes"], candidate["alpha"])
+                    by_config.setdefault(key, []).append((seed, candidate))
+                objectives = [("max_val_acc", "val_acc", True)] + [
+                    (f"min_{metric}", metric, False) for metric in ("he", "rce", "ree")]
+                for criterion, objective, maximize in objectives:
+                    eligible = []
+                    for config, rows in by_config.items():
+                        values = [c[objective] for _, c in rows]
+                        if len(rows) == args.seeds and np.all(np.isfinite(values)):
+                            eligible.append((float(np.mean(values)), config, rows))
+                    if not eligible:
+                        continue
+                    selected = (max if maximize else min)(eligible, key=lambda item: item[0])
+                    for seed, c in sorted(selected[2], key=lambda item: item[0]):
+                        best_w.writerow([name, m, args.clf_input, args.alpha_mode, f"{c['alpha']:.4f}", seed,
+                                         criterion, c["F"], hash_name, ratio, c["projectors"], c["shingle_hashes"],
+                                         f"{c['val_acc']:.4f}", f"{c['test_acc']:.4f}",
+                                         f"{c['he']:.6f}", f"{c['rce']:.6f}", f"{c['ree']:.6f}",
+                                         f"{100*c['purity']:.2f}", f"{c['n_over_N']:.4f}"])
             best_fout.flush()
     fout.close()
     best_fout.close()
