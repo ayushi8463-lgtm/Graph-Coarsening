@@ -23,7 +23,6 @@ from scipy.sparse.linalg import eigsh, svds
 RATIOS = [0.5, 0.3]      # supernodes / nodes
 SEEDS = range(5)
 L_PROJ = 10              # number of LSH projectors
-REE_K = 10               # top-k eigenvalues for REE
 
 # ----------------------------------------------------------------- data
 URL = "https://raw.githubusercontent.com/kimiyoung/planetoid/master/data/ind.cora."
@@ -136,14 +135,40 @@ def coarsen(F, ratio, rng, mode="random"):
 
 
 # --------------------------------------------------------------- metrics
-def ree(A, C, k=REE_K):
-    deg = np.asarray(A.sum(1)).ravel()
-    L = sp.diags(deg) - A
-    cnt = np.asarray(C.sum(0)).ravel()
-    Cn = C @ sp.diags(cnt ** -0.5)
-    Lc = Cn.T @ L @ Cn
-    lam = np.sort(eigsh(L, k=k, which="LA", return_eigenvectors=False))
-    lam_c = np.sort(eigsh(Lc, k=k, which="LA", return_eigenvectors=False))
+def ree(A, C, k=None):
+    """REE used by the AH-UGC evaluators: compare top Laplacian eigenvalues
+    of the original graph and the Laplacian of the weighted coarse graph.
+
+    ``k`` defaults to 100 (or N/2 for small graphs), then is capped by the
+    coarse graph size, matching ``SpectralRef`` in ahugc_eval.py.
+    """
+    A = sp.csr_matrix(A, dtype=np.float64)
+    C = sp.csr_matrix(C, dtype=np.float64)
+    N, n = A.shape[0], C.shape[1]
+    if k is None:
+        k = N // 2 if N < 100 else 100
+    else:
+        # Preserve explicit small-k callers while using the evaluator's
+        # default when no k is supplied.
+        k = min(k, N // 2 if N < 100 else 100)
+    k = min(k, n)
+
+    Ac = (C.T @ A @ C).tocsr()
+    Ac.setdiag(0)
+    Ac.eliminate_zeros()
+
+    def top_eigenvalues(L):
+        if L.shape[0] <= 1200 or k >= L.shape[0] - 1:
+            values = np.linalg.eigvalsh(L.toarray())
+        else:
+            values = eigsh(L, k=k, which="LM", tol=1e-3,
+                           return_eigenvectors=False)
+        return np.sort(values)[-k:]
+
+    L = sp.diags(np.asarray(A.sum(1)).ravel()) - A
+    Lc = sp.diags(np.asarray(Ac.sum(1)).ravel()) - Ac
+    lam = top_eigenvalues(L)
+    lam_c = top_eigenvalues(Lc)
     return np.mean(np.abs(lam_c - lam) / lam)
 
 
