@@ -3,8 +3,9 @@ ahugc_eval_v2.py -- AH-UGC coarsening (random hash or PCA Z-order hash) + node c
 trained on the coarsened graph and tested on the ORIGINAL graph.
 
 HOMOGENEOUS datasets : cora, citeseer, pubmed (Planetoid), cornell (WebKB), film (Actor)    [PyG, auto-download]
-HETEROGENEOUS        : dblp, imdb (PyG), acm (PyG HGBDataset)   -- same loaders/targets as the HGCond repo the
-                       AH-UGC paper takes its hetero models from;  hetero_synth = tiny synthetic smoke test.
+HETEROGENEOUS        : dblp, imdb (PyG), acm (PyG HGBDataset)   -- DBLP is the HAN/PyG author-paper-term-conference
+                       graph (the variant described in AH-UGC Table 6); ACM is HGB ACM, as in HGCond.
+                       hetero_synth = tiny synthetic smoke test.
 
 F        : feat  = X only
            orig  = [(1-a) X | a A]                     (AH-UGC / UGC augmented feature)
@@ -546,6 +547,9 @@ def load_hetero(name, root, acm_index=None):
     if name == "hetero_synth":
         return make_hetero_synth()
     if name == "dblp":
+        # AH-UGC Table 6 describes the HAN DBLP graph: author labels (4 classes),
+        # author/paper/term/conference node types and the listed typed relations.
+        # PyG DBLP is the canonical loader for this 4-type, feature-bearing variant.
         from torch_geometric.datasets import DBLP
         d = DBLP(f"{root}/DBLP")[0]
         d["conference"].x = torch.ones(d["conference"].num_nodes, 1)           # as in HGCond utils_data.py
@@ -557,6 +561,8 @@ def load_hetero(name, root, acm_index=None):
         hd = hetero_from_pyg(d, "movie", "imdb")
         hd.public = tuple(d["movie"][k].numpy() for k in ("train_mask", "val_mask", "test_mask"))
     elif name == "acm":
+        # HGCond (the heterogeneous model implementation cited by AH-UGC) uses
+        # the HGB ACM graph and replaces missing term features by all-ones.
         from torch_geometric.datasets import HGBDataset
         d = HGBDataset(f"{root}/HGB", "ACM")[0]
         d["term"].x = torch.ones(d["term"].num_nodes, 1)                         # as in HGCond utils_data.py
